@@ -2,6 +2,11 @@
 pragma solidity ^0.8.24;
 
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Scoring} from "./libraries/Scoring.sol";
+import {StreakLib} from "./libraries/StreakLib.sol";
+import {IRedStonePriceFeed} from "./interfaces/IRedStonePriceFeed.sol";
 
 interface IBlockArenaHighlights {
     function mintHighlight(
@@ -10,139 +15,103 @@ interface IBlockArenaHighlights {
     ) external returns (uint256);
 }
 
-/// @title ArenaEngine — Real-time prediction game for MegaETH (v2)
-/// @notice Players predict price direction (UP/DOWN) each tick, commit-reveal, top scorers split the pot.
-/// @dev Storage-optimized for MegaETH: packed structs, slot reuse, minimal new allocations.
-contract ArenaEngine is Pausable {
+/// @title ArenaEngine v4 — Trustless oracle-based prediction game for MegaETH
+/// @dev Price tapes built permissionlessly from RedStone oracle readings
+contract ArenaEngine is Pausable, Ownable2Step, ReentrancyGuard {
 
-    // ─── Types ────────────────────────────────────────────────────────
-
-    /// @notice Arena tier determines entry fee and rake percentage
     enum Tier { Low, Mid, High, VIP }
 
-    /// @dev Packed into 2 storage slots (Arena struct = 40 bytes)
     struct Arena {
-        uint40  startBlock;    // 5 bytes
-        uint40  endBlock;      // 5 bytes
-        uint128 pot;           // 16 bytes
-        uint16  playerCount;   // 2 bytes
-        Tier    tier;          // 1 byte
-        bool    finalized;     // 1 byte
-        // --- slot boundary (30 bytes above) ---
-        uint256 tournamentId;  // 32 bytes (0 = not part of tournament; stored as id+1)
+        uint40  startBlock;
+        uint40  endBlock;
+        uint128 pot;
+        uint16  playerCount;
+        Tier    tier;
+        bool    finalized;
+        uint256 tournamentId; // 0=none, stored as id+1
     }
 
-    /// @dev Tournament data
+    struct PlayerState {
+        bytes32 commitHash; // sentinel 0x01 = joined, real hash = committed
+        bool    revealed;
+        uint16  score;
+    }
+
     struct Tournament {
-        Tier    tier;           // 1 byte
-        uint8   roundCount;     // 1 byte
-        uint8   arenasPerRound; // 1 byte
-        uint8   currentRound;   // 1 byte
-        bool    finalized;      // 1 byte
-        uint128 pot;            // 16 bytes
-        address creator;        // 20 bytes
+        Tier    tier;
+        uint8   roundCount;
+        uint8   arenasPerRound;
+        uint8   currentRound;
+        bool    finalized;
+        uint128 pot;
+        address creator;
     }
 
-    // ─── Constants ────────────────────────────────────────────────────
+    /// @notice Tracks oracle recording state per arena
+    struct OracleState {
+        uint40  nextBlock;      // next block number to record
+        uint40  ticksRecorded;  // how many ticks recorded so far
+        int256  lastPrice;      // last recorded price (for direction comparison)
+    }
 
-    /// @dev Entry fees per tier (in wei)
+    // Constants
     uint128 internal constant FEE_LOW  = 0.001 ether;
     uint128 internal constant FEE_MID  = 0.01 ether;
     uint128 internal constant FEE_HIGH = 0.1 ether;
     uint128 internal constant FEE_VIP  = 1 ether;
 
-    /// @dev Rake basis points per tier (5%, 4%, 3%, 2%)
     uint16 internal constant RAKE_LOW  = 500;
     uint16 internal constant RAKE_MID  = 400;
     uint16 internal constant RAKE_HIGH = 300;
     uint16 internal constant RAKE_VIP  = 200;
 
-    /// @dev Fee split: 80% treasury, 20% referrer
     uint16 internal constant TREASURY_SHARE_BPS = 8000;
     uint16 internal constant REFERRER_SHARE_BPS = 2000;
-
-    /// @dev Emergency withdraw: arena must be stuck for this many blocks
     uint40 internal constant EMERGENCY_BLOCK_DELAY = 50000;
 
-    /// @dev Streak multiplier constants (basis points: 10000 = 1x)
-    uint16 internal constant STREAK_2_MULT  = 11000; // 1.1x
-    uint16 internal constant STREAK_3_MULT  = 12000; // 1.2x
-    uint16 internal constant STREAK_5_MULT  = 15000; // 1.5x
-
-    // ─── Storage ──────────────────────────────────────────────────────
-
+    // Storage
     uint256 public nextArenaId;
     uint256 public nextTournamentId;
-    address public owner;
     address public highlightsNFT;
-
-    /// @dev Accumulated treasury balance
     uint256 public treasuryBalance;
 
-    /// @dev arenaId → Arena metadata
+    /// @notice RedStone price feed oracle
+    IRedStonePriceFeed public oracle;
+
     mapping(uint256 => Arena) public arenas;
-
-    /// @dev arenaId → packed price tape (owner sets after arena ends)
-    mapping(uint256 => bytes) public priceTapes;
-
-    /// @dev arenaId → player → commit hash
-    mapping(uint256 => mapping(address => bytes32)) public commits;
-
-    /// @dev arenaId → player → revealed predictions (bit-packed)
-    mapping(uint256 => mapping(address => uint256)) public reveals;
-
-    /// @dev arenaId → player → bool (joined)
-    mapping(uint256 => mapping(address => bool)) public joined;
-
-    /// @dev arenaId → player → score (set during finalize)
-    mapping(uint256 => mapping(address => uint256)) public scores;
-
-    /// @dev arenaId → player list for iteration during finalize
-    mapping(uint256 => address[]) internal _players;
-
-    /// @dev God streak: consecutive arena wins per player
+    mapping(uint256 => uint32) public arenaEpoch;
+    mapping(uint256 => uint256[]) internal _priceTape;
+    mapping(uint256 => OracleState) public oracleState;
+    mapping(uint256 => mapping(uint32 => mapping(address => PlayerState))) internal _playerState;
     mapping(address => uint16) public godStreak;
-
-    /// @dev Referral: player → referrer (one-time, immutable)
     mapping(address => address) public referrer;
-
-    /// @dev Referrer accumulated earnings
     mapping(address => uint256) public referrerBalance;
-
-    /// @dev Tournament data
     mapping(uint256 => Tournament) public tournaments;
-
-    /// @dev Tournament → round → list of arena IDs
     mapping(uint256 => mapping(uint8 => uint256[])) public tournamentRoundArenas;
-
-    /// @dev Tournament → round → qualified players
     mapping(uint256 => mapping(uint8 => mapping(address => bool))) public tournamentQualified;
 
-    /// @dev Tournament → round → qualified player list
-    mapping(uint256 => mapping(uint8 => address[])) internal _tournamentQualifiedList;
-
-    // ─── Events ───────────────────────────────────────────────────────
-
+    // Events
     event ArenaCreated(uint256 indexed arenaId, Tier tier, uint128 entryFee, uint40 startBlock, uint40 endBlock);
-    event PlayerJoined(uint256 indexed arenaId, address indexed player);
+    event PlayerJoined(uint256 indexed arenaId, address indexed player, address indexed ref);
     event PredictionCommitted(uint256 indexed arenaId, address indexed player);
-    event PredictionRevealed(uint256 indexed arenaId, address indexed player, uint256 predictions);
-    event ArenaFinalized(uint256 indexed arenaId);
+    event PredictionRevealed(uint256 indexed arenaId, address indexed player);
+    event ArenaFinalized(uint256 indexed arenaId, uint256 winnerCount, uint16 bestScore);
     event PotDistributed(uint256 indexed arenaId, address indexed winner, uint256 amount);
     event GodStreakUpdate(address indexed player, uint16 streak);
-    event ReferralPaid(address indexed referrer, address indexed player, uint256 amount);
-    event ReferrerSet(address indexed player, address indexed referrer);
-    event EmergencyWithdraw(uint256 indexed arenaId, uint256 amount);
+    event ReferralPaid(address indexed ref, address indexed player, uint256 amount);
+    event ReferrerSet(address indexed player, address indexed ref);
+    event EmergencyWithdraw(uint256 indexed arenaId, address indexed player, uint256 amount);
     event TreasuryWithdrawn(address indexed to, uint256 amount);
     event HighlightsNFTSet(address indexed nft);
+    event OracleSet(address indexed oracle);
+    event TicksRecorded(uint256 indexed arenaId, uint40 count);
     event TournamentCreated(uint256 indexed tournamentId, Tier tier, uint8 roundCount, uint8 arenasPerRound);
     event TournamentArenaAdded(uint256 indexed tournamentId, uint8 round, uint256 arenaId);
     event TournamentPlayerQualified(uint256 indexed tournamentId, uint8 round, address indexed player);
-    event TournamentFinalized(uint256 indexed tournamentId, address indexed winner, uint256 prize);
+    event TournamentFinalized(uint256 indexed tournamentId);
+    event ArenaReset(uint256 indexed arenaId, uint32 newEpoch);
 
-    // ─── Errors ───────────────────────────────────────────────────────
-
-    error NotOwner();
+    // Errors
     error ArenaNotFound();
     error ArenaAlreadyStarted();
     error ArenaNotStarted();
@@ -161,67 +130,62 @@ contract ArenaEngine is Pausable {
     error NothingToWithdraw();
     error TournamentNotFound();
     error TournamentAlreadyFinalized();
-    error NotQualified();
     error InvalidRound();
     error TransferFailed();
+    error TapeNotSet();
+    error InvalidPlayersArray();
+    error OracleNotSet();
+    error NoTicksToRecord();
+    error ArenaNotActive();
+    error TapeAlreadyComplete();
 
-    // ─── Constructor ──────────────────────────────────────────────────
+    constructor() Ownable(msg.sender) {}
 
-    constructor() {
-        owner = msg.sender;
-    }
+    // ─── Config ───────────────────────────────────────────────────────
 
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
-
-    // ─── Configuration ────────────────────────────────────────────────
-
-    /// @notice Set the Highlights NFT contract address
     function setHighlightsNFT(address _nft) external onlyOwner {
         if (_nft == address(0)) revert ZeroAddress();
         highlightsNFT = _nft;
         emit HighlightsNFTSet(_nft);
     }
 
-    /// @notice Pause all state-changing operations
-    function pause() external onlyOwner { _pause(); }
+    /// @notice Set the RedStone price feed oracle address
+    function setOracle(address priceFeed) external onlyOwner {
+        if (priceFeed == address(0)) revert ZeroAddress();
+        oracle = IRedStonePriceFeed(priceFeed);
+        emit OracleSet(priceFeed);
+    }
 
-    /// @notice Unpause
+    function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 
     // ─── Fee Helpers ──────────────────────────────────────────────────
 
-    /// @notice Get entry fee for a tier
     function getEntryFee(Tier tier) public pure returns (uint128) {
-        if (tier == Tier.Low)  return FEE_LOW;
-        if (tier == Tier.Mid)  return FEE_MID;
+        if (tier == Tier.Low) return FEE_LOW;
+        if (tier == Tier.Mid) return FEE_MID;
         if (tier == Tier.High) return FEE_HIGH;
         return FEE_VIP;
     }
 
-    /// @notice Get rake basis points for a tier
     function getRakeBps(Tier tier) public pure returns (uint16) {
-        if (tier == Tier.Low)  return RAKE_LOW;
-        if (tier == Tier.Mid)  return RAKE_MID;
+        if (tier == Tier.Low) return RAKE_LOW;
+        if (tier == Tier.Mid) return RAKE_MID;
         if (tier == Tier.High) return RAKE_HIGH;
         return RAKE_VIP;
     }
 
-    // ─── Referral System ──────────────────────────────────────────────
+    // ─── Referral ─────────────────────────────────────────────────────
 
-    /// @notice Set referrer — one-time per player
-    function setReferrer(address _referrer) external {
-        if (_referrer == address(0)) revert ZeroAddress();
-        if (_referrer == msg.sender) revert SelfReferral();
+    function setReferrer(address _ref) external {
+        if (_ref == address(0)) revert ZeroAddress();
+        if (_ref == msg.sender) revert SelfReferral();
         if (referrer[msg.sender] != address(0)) revert ReferrerAlreadySet();
-        referrer[msg.sender] = _referrer;
-        emit ReferrerSet(msg.sender, _referrer);
+        referrer[msg.sender] = _ref;
+        emit ReferrerSet(msg.sender, _ref);
     }
 
-    /// @notice Referrer withdraws accumulated earnings
-    function withdrawReferralEarnings() external {
+    function withdrawReferralEarnings() external nonReentrant {
         uint256 bal = referrerBalance[msg.sender];
         if (bal == 0) revert NothingToWithdraw();
         referrerBalance[msg.sender] = 0;
@@ -231,8 +195,7 @@ contract ArenaEngine is Pausable {
 
     // ─── Treasury ─────────────────────────────────────────────────────
 
-    /// @notice Owner withdraws accumulated treasury
-    function withdrawTreasury() external onlyOwner {
+    function withdrawTreasury() external onlyOwner nonReentrant {
         uint256 bal = treasuryBalance;
         if (bal == 0) revert NothingToWithdraw();
         treasuryBalance = 0;
@@ -243,190 +206,264 @@ contract ArenaEngine is Pausable {
 
     // ─── Arena Lifecycle ──────────────────────────────────────────────
 
-    /// @notice Create a new arena with a specific tier
-    function createArena(Tier tier, uint40 durationInBlocks) external onlyOwner whenNotPaused returns (uint256 arenaId) {
+    function createArena(Tier tier, uint40 duration) external onlyOwner whenNotPaused returns (uint256 arenaId) {
         arenaId = nextArenaId++;
         uint40 start = uint40(block.number) + 100;
-        uint128 entryFee = getEntryFee(tier);
         arenas[arenaId] = Arena({
             startBlock: start,
-            endBlock: start + durationInBlocks,
+            endBlock: start + duration,
             pot: 0,
             playerCount: 0,
             tier: tier,
             finalized: false,
             tournamentId: 0
         });
-        emit ArenaCreated(arenaId, tier, entryFee, start, start + durationInBlocks);
+        emit ArenaCreated(arenaId, tier, getEntryFee(tier), start, start + duration);
     }
 
-    /// @notice Join an arena before it starts, paying the entry fee.
+    /// @notice Join arena — emits event instead of storing address array
     function joinArena(uint256 arenaId) external payable whenNotPaused {
         Arena storage a = arenas[arenaId];
         if (a.startBlock == 0) revert ArenaNotFound();
         if (block.number >= a.startBlock) revert ArenaAlreadyStarted();
-        if (joined[arenaId][msg.sender]) revert AlreadyJoined();
+        PlayerState storage ps = _playerState[arenaId][arenaEpoch[arenaId]][msg.sender];
+        if (ps.commitHash != bytes32(0)) revert AlreadyJoined();
         uint128 fee = getEntryFee(a.tier);
         if (msg.value < fee) revert InsufficientFee();
 
-        joined[arenaId][msg.sender] = true;
-        _players[arenaId].push(msg.sender);
+        ps.commitHash = bytes32(uint256(1)); // sentinel: joined
         a.playerCount++;
         a.pot += uint128(msg.value);
-
-        emit PlayerJoined(arenaId, msg.sender);
+        emit PlayerJoined(arenaId, msg.sender, referrer[msg.sender]);
     }
 
-    /// @notice Commit hashed prediction during the arena.
     function commitPrediction(uint256 arenaId, bytes32 commitHash) external whenNotPaused {
         Arena storage a = arenas[arenaId];
         if (a.startBlock == 0) revert ArenaNotFound();
         if (block.number < a.startBlock) revert ArenaNotStarted();
         if (block.number > a.endBlock) revert ArenaNotEnded();
-        if (!joined[arenaId][msg.sender]) revert NotJoined();
-        if (commits[arenaId][msg.sender] != bytes32(0)) revert AlreadyCommitted();
+        PlayerState storage ps = _playerState[arenaId][arenaEpoch[arenaId]][msg.sender];
+        if (ps.commitHash == bytes32(0)) revert NotJoined();
+        if (ps.commitHash != bytes32(uint256(1))) revert AlreadyCommitted();
 
-        commits[arenaId][msg.sender] = commitHash;
+        ps.commitHash = commitHash;
         emit PredictionCommitted(arenaId, msg.sender);
     }
 
-    /// @notice Reveal prediction after arena ends.
-    function revealPrediction(uint256 arenaId, uint256 bitPackedPredictions, bytes32 salt) external whenNotPaused {
+    function revealPrediction(
+        uint256 arenaId,
+        uint256[] calldata predWords,
+        bytes32 salt
+    ) external whenNotPaused {
         Arena storage a = arenas[arenaId];
         if (a.startBlock == 0) revert ArenaNotFound();
         if (block.number <= a.endBlock) revert ArenaNotEnded();
         if (a.finalized) revert ArenaAlreadyFinalized();
-        if (!joined[arenaId][msg.sender]) revert NotJoined();
+        PlayerState storage ps = _playerState[arenaId][arenaEpoch[arenaId]][msg.sender];
+        if (ps.commitHash == bytes32(0) || ps.commitHash == bytes32(uint256(1))) revert NotJoined();
+        if (ps.revealed) revert AlreadyCommitted();
 
-        bytes32 expected = keccak256(abi.encodePacked(arenaId, msg.sender, salt, bitPackedPredictions));
-        if (commits[arenaId][msg.sender] != expected) revert InvalidReveal();
+        bytes32 expected = keccak256(abi.encodePacked(arenaId, msg.sender, salt, keccak256(abi.encode(predWords))));
+        if (ps.commitHash != expected) revert InvalidReveal();
 
-        reveals[arenaId][msg.sender] = bitPackedPredictions;
-        emit PredictionRevealed(arenaId, msg.sender, bitPackedPredictions);
+        ps.revealed = true;
+        emit PredictionRevealed(arenaId, msg.sender);
     }
 
-    /// @notice Owner submits the actual price tape after arena ends.
-    function submitPriceTape(uint256 arenaId, bytes calldata packedPriceTape) external onlyOwner {
+    // ─── Oracle Price Tape Recording ──────────────────────────────────
+
+    /// @notice Record oracle price ticks for an arena. Permissionless — anyone can call.
+    /// @dev Reads the current price from RedStone oracle and records direction bits.
+    ///      Each bit represents one block: 1 = price went up or stayed same, 0 = price went down.
+    ///      Can only record for the current block. Call once per block during the arena.
+    /// @param arenaId The arena to record ticks for
+    function recordTick(uint256 arenaId) external {
+        if (address(oracle) == address(0)) revert OracleNotSet();
         Arena storage a = arenas[arenaId];
         if (a.startBlock == 0) revert ArenaNotFound();
-        if (block.number <= a.endBlock) revert ArenaNotEnded();
-        priceTapes[arenaId] = packedPriceTape;
+        if (a.finalized) revert ArenaAlreadyFinalized();
+
+        uint40 currentBlock = uint40(block.number);
+        if (currentBlock < a.startBlock || currentBlock > a.endBlock) revert ArenaNotActive();
+
+        OracleState storage os = oracleState[arenaId];
+        uint40 totalTicks = a.endBlock - a.startBlock;
+
+        if (os.ticksRecorded >= totalTicks) revert TapeAlreadyComplete();
+
+        // Initialize on first call
+        if (os.ticksRecorded == 0) {
+            os.nextBlock = a.startBlock;
+            os.lastPrice = oracle.latestAnswer();
+        }
+
+        // Must be at or past the next expected block
+        if (currentBlock < os.nextBlock) revert NoTicksToRecord();
+
+        int256 currentPrice = oracle.latestAnswer();
+
+        // Record tick for current block
+        uint40 tickIndex = os.ticksRecorded;
+        uint256 wordIdx = tickIndex >> 8;    // tickIndex / 256
+        uint256 bitIdx = 255 - (tickIndex & 0xFF); // MSB-first
+
+        // Ensure tape array is large enough
+        while (_priceTape[arenaId].length <= wordIdx) {
+            _priceTape[arenaId].push(0);
+        }
+
+        // Direction bit: 1 = up or same, 0 = down
+        if (currentPrice >= os.lastPrice) {
+            _priceTape[arenaId][wordIdx] |= (1 << bitIdx);
+        }
+
+        os.lastPrice = currentPrice;
+        os.ticksRecorded++;
+        os.nextBlock = currentBlock + 1;
+
+        emit TicksRecorded(arenaId, os.ticksRecorded);
     }
 
-    /// @notice Finalize arena: score players, distribute pot to top scorer(s).
-    /// @dev Takes rake, splits fees, tracks god streaks, mints highlight NFT.
-    function finalizeArena(uint256 arenaId) external whenNotPaused {
+    /// @notice Batch-record multiple ticks by reading oracle at current block.
+    /// @dev For catching up missed blocks — fills gaps with the current oracle reading.
+    ///      The oracle price at call time is used for all gap ticks (best available data).
+    ///      This is safe because on MegaETH with RedStone Bolt, callers are incentivized
+    ///      to call frequently since gap-filling uses current price for all missed blocks.
+    /// @param arenaId The arena to record ticks for
+    /// @param maxTicks Maximum number of ticks to record in this call (gas limit)
+    function recordTicks(uint256 arenaId, uint40 maxTicks) external {
+        if (address(oracle) == address(0)) revert OracleNotSet();
+        Arena storage a = arenas[arenaId];
+        if (a.startBlock == 0) revert ArenaNotFound();
+        if (a.finalized) revert ArenaAlreadyFinalized();
+
+        uint40 currentBlock = uint40(block.number);
+        if (currentBlock < a.startBlock) revert ArenaNotActive();
+
+        OracleState storage os = oracleState[arenaId];
+        uint40 totalTicks = a.endBlock - a.startBlock;
+
+        if (os.ticksRecorded >= totalTicks) revert TapeAlreadyComplete();
+
+        // Initialize on first call
+        if (os.ticksRecorded == 0) {
+            os.nextBlock = a.startBlock;
+            os.lastPrice = oracle.latestAnswer();
+        }
+
+        if (currentBlock < os.nextBlock) revert NoTicksToRecord();
+
+        int256 currentPrice = oracle.latestAnswer();
+
+        // Calculate how many ticks we can record
+        uint40 endBlock = currentBlock < a.endBlock ? currentBlock : a.endBlock;
+        uint40 availableTicks = endBlock - os.nextBlock + 1;
+        uint40 remaining = totalTicks - os.ticksRecorded;
+        uint40 ticksToRecord = availableTicks < remaining ? availableTicks : remaining;
+        if (ticksToRecord > maxTicks) ticksToRecord = maxTicks;
+        if (ticksToRecord == 0) revert NoTicksToRecord();
+
+        // Direction bit based on current vs last price
+        bool isUp = currentPrice >= os.lastPrice;
+
+        for (uint40 i; i < ticksToRecord; ++i) {
+            uint40 tickIndex = os.ticksRecorded + i;
+            uint256 wordIdx = tickIndex >> 8;
+            uint256 bitIdx = 255 - (tickIndex & 0xFF);
+
+            while (_priceTape[arenaId].length <= wordIdx) {
+                _priceTape[arenaId].push(0);
+            }
+
+            if (isUp) {
+                _priceTape[arenaId][wordIdx] |= (1 << bitIdx);
+            }
+        }
+
+        os.lastPrice = currentPrice;
+        os.ticksRecorded += ticksToRecord;
+        os.nextBlock = endBlock + 1;
+
+        emit TicksRecorded(arenaId, os.ticksRecorded);
+    }
+
+    /// @notice Finalize — player list passed as calldata (from PlayerJoined events)
+    function finalizeArena(
+        uint256 arenaId,
+        address[] calldata players,
+        uint256[][] calldata predWordsList
+    ) external onlyOwner whenNotPaused nonReentrant {
         Arena storage a = arenas[arenaId];
         if (a.startBlock == 0) revert ArenaNotFound();
         if (block.number <= a.endBlock) revert ArenaNotEnded();
         if (a.finalized) revert ArenaAlreadyFinalized();
         if (a.playerCount == 0) revert NoPlayers();
+        if (players.length != predWordsList.length) revert InvalidPlayersArray();
+        if (_priceTape[arenaId].length == 0) revert TapeNotSet();
 
-        bytes memory tape = priceTapes[arenaId];
-        uint256 tapeWord;
-        if (tape.length >= 32) {
-            assembly { tapeWord := mload(add(tape, 32)) }
-        } else {
-            for (uint256 i = 0; i < tape.length; i++) {
-                tapeWord |= uint256(uint8(tape[i])) << (248 - i * 8);
-            }
-        }
-
-        uint256 numTicks = (a.endBlock - a.startBlock);
-        if (numTicks > 256) numTicks = 256;
-
-        address[] storage players = _players[arenaId];
+        uint256 ticks = oracleState[arenaId].ticksRecorded;
+        if (ticks == 0) revert TapeNotSet();
         uint256 len = players.length;
 
-        // Score each player
-        uint256 bestScore = 0;
-        for (uint256 i = 0; i < len; i++) {
-            uint256 pred = reveals[arenaId][players[i]];
-            if (pred == 0 && commits[arenaId][players[i]] == bytes32(0)) continue;
-
-            uint256 diff = pred ^ tapeWord;
-            uint256 mask = numTicks == 256 ? type(uint256).max : ((1 << numTicks) - 1) << (256 - numTicks);
-            uint256 wrong = _popcount(diff & mask);
-            uint256 score = numTicks - wrong;
-
-            scores[arenaId][players[i]] = score;
-            if (score > bestScore) bestScore = score;
-        }
-
-        // Calculate rake
-        uint256 totalPot = a.pot;
-        uint16 rakeBps = getRakeBps(a.tier);
-        uint256 rake = (totalPot * rakeBps) / 10000;
-        uint256 distributablePot = totalPot - rake;
-
-        // Split rake: treasury + referrer fees
-        _distributeRake(rake, players, len);
-
-        // Find winners and distribute
-        uint256 winnerCount = 0;
-        for (uint256 i = 0; i < len; i++) {
-            if (scores[arenaId][players[i]] == bestScore && bestScore > 0) {
+        // Score
+        uint16 bestScore;
+        uint256 winnerCount;
+        for (uint256 i; i < len; ++i) {
+            PlayerState storage ps = _playerState[arenaId][arenaEpoch[arenaId]][players[i]];
+            if (!ps.revealed) continue;
+            uint256 raw = Scoring.scorePlayer(predWordsList[i], _priceTape[arenaId], ticks);
+            uint16 sc = uint16(raw);
+            ps.score = sc;
+            if (sc > bestScore) {
+                bestScore = sc;
+                winnerCount = 1;
+            } else if (sc == bestScore && sc > 0) {
                 winnerCount++;
             }
         }
 
+        // Rake
+        uint256 totalPot = a.pot;
+        uint256 rake = (totalPot * getRakeBps(a.tier)) / 10000;
+        uint256 distributable = totalPot - rake;
+        _distributeRake(rake, players, len);
+
+        // Payout
         if (winnerCount > 0) {
-            // Calculate base share
-            uint256 baseShare = distributablePot / winnerCount;
-
-            for (uint256 i = 0; i < len; i++) {
+            uint256 baseShare = distributable / winnerCount;
+            bool nftMinted;
+            for (uint256 i; i < len; ++i) {
                 address player = players[i];
-                bool isWinner = scores[arenaId][player] == bestScore && bestScore > 0;
-
-                if (isWinner) {
-                    // Update god streak
+                PlayerState storage ps = _playerState[arenaId][arenaEpoch[arenaId]][player];
+                if (ps.score == bestScore && bestScore > 0) {
                     godStreak[player]++;
                     uint16 streak = godStreak[player];
                     emit GodStreakUpdate(player, streak);
-
-                    // Apply streak multiplier
-                    uint256 share = _applyStreakMultiplier(baseShare, streak);
-
-                    // Cap share to available balance (multiplier can exceed pot in edge cases)
+                    uint256 share = (baseShare * StreakLib.getMultiplier(streak)) / 10000;
                     if (share > address(this).balance) share = address(this).balance;
-
                     (bool ok,) = player.call{value: share}("");
                     if (ok) emit PotDistributed(arenaId, player, share);
-
-                    // Mint highlight NFT for top scorer (first winner only)
-                    if (i == _firstWinnerIndex(players, len, bestScore, arenaId) && highlightsNFT != address(0)) {
+                    if (!nftMinted && highlightsNFT != address(0)) {
+                        nftMinted = true;
                         try IBlockArenaHighlights(highlightsNFT).mintHighlight(
-                            player,
-                            uint40(arenaId),
-                            a.startBlock,
-                            a.endBlock,
-                            uint16(bestScore),
-                            streak
+                            player, uint40(arenaId), a.startBlock, a.endBlock, bestScore, streak
                         ) {} catch {}
                     }
-
-                    // Qualify for tournament if applicable (tournamentId stored as id+1)
-                    if (a.tournamentId != 0) {
-                        _qualifyForTournament(a.tournamentId - 1, player);
-                    }
-                } else {
-                    // Reset god streak on loss (player participated but didn't win)
-                    if (godStreak[player] > 0) {
-                        godStreak[player] = 0;
-                        emit GodStreakUpdate(player, 0);
-                    }
+                    if (a.tournamentId != 0) _qualifyForTournament(a.tournamentId - 1, player);
+                } else if (ps.revealed && godStreak[player] > 0) {
+                    godStreak[player] = 0;
+                    emit GodStreakUpdate(player, 0);
                 }
             }
         }
 
         a.finalized = true;
-        emit ArenaFinalized(arenaId);
+        emit ArenaFinalized(arenaId, winnerCount, bestScore);
     }
 
-    // ─── Emergency Controls ───────────────────────────────────────────
+    // ─── Emergency ────────────────────────────────────────────────────
 
-    /// @notice Emergency withdraw if arena is stuck (not finalized after EMERGENCY_BLOCK_DELAY blocks past end)
-    function emergencyWithdraw(uint256 arenaId) external onlyOwner {
+    function emergencyWithdraw(uint256 arenaId, address[] calldata players) external onlyOwner nonReentrant {
         Arena storage a = arenas[arenaId];
         if (a.startBlock == 0) revert ArenaNotFound();
         if (a.finalized) revert ArenaAlreadyFinalized();
@@ -436,179 +473,123 @@ contract ArenaEngine is Pausable {
         a.pot = 0;
         a.finalized = true;
 
-        // Refund equally to all players
-        address[] storage players = _players[arenaId];
         uint256 len = players.length;
         if (len > 0) {
             uint256 refund = amount / len;
-            for (uint256 i = 0; i < len; i++) {
-                (bool ok,) = players[i].call{value: refund}("");
-                if (ok) {} // best effort
+            for (uint256 i; i < len; ++i) {
+                if (_playerState[arenaId][arenaEpoch[arenaId]][players[i]].commitHash != bytes32(0)) {
+                    (bool ok,) = players[i].call{value: refund}("");
+                    if (ok) emit EmergencyWithdraw(arenaId, players[i], refund);
+                }
             }
         }
-
-        emit EmergencyWithdraw(arenaId, amount);
     }
 
-    // ─── Tournament Mode ──────────────────────────────────────────────
+    // ─── Arena Reset (Epoching) ─────────────────────────────────────
 
-    /// @notice Create a tournament
-    function createTournament(
-        Tier tier,
-        uint8 roundCount,
-        uint8 arenasPerRound
-    ) external onlyOwner whenNotPaused returns (uint256 tournamentId) {
-        tournamentId = nextTournamentId++;
-        tournaments[tournamentId] = Tournament({
-            tier: tier,
-            roundCount: roundCount,
-            arenasPerRound: arenasPerRound,
-            currentRound: 0,
-            finalized: false,
-            pot: 0,
-            creator: msg.sender
-        });
-        emit TournamentCreated(tournamentId, tier, roundCount, arenasPerRound);
+    function resetArena(uint256 arenaId, uint40 duration) external onlyOwner {
+        Arena storage a = arenas[arenaId];
+        if (a.startBlock == 0) revert ArenaNotFound();
+        if (!a.finalized) revert ArenaNotEnded();
+
+        uint32 newEpoch = arenaEpoch[arenaId] + 1;
+        arenaEpoch[arenaId] = newEpoch;
+
+        uint40 start = uint40(block.number) + 100;
+        a.startBlock = start;
+        a.endBlock = start + duration;
+        a.pot = 0;
+        a.playerCount = 0;
+        a.finalized = false;
+        a.tournamentId = 0;
+
+        delete _priceTape[arenaId];
+        delete oracleState[arenaId];
+
+        emit ArenaReset(arenaId, newEpoch);
     }
 
-    /// @notice Add an arena to a tournament round
-    function addArenaToTournament(uint256 tournamentId, uint256 arenaId, uint8 round) external onlyOwner {
-        if (tournaments[tournamentId].roundCount == 0) revert TournamentNotFound();
-        if (round >= tournaments[tournamentId].roundCount) revert InvalidRound();
+    // ─── Tournament ───────────────────────────────────────────────────
 
-        arenas[arenaId].tournamentId = tournamentId + 1; // +1 so 0 means "no tournament"
-        tournamentRoundArenas[tournamentId][round].push(arenaId);
-        emit TournamentArenaAdded(tournamentId, round, arenaId);
+    function createTournament(Tier tier, uint8 roundCount, uint8 arenasPerRound)
+        external onlyOwner whenNotPaused returns (uint256 id)
+    {
+        id = nextTournamentId++;
+        tournaments[id] = Tournament(tier, roundCount, arenasPerRound, 0, false, 0, msg.sender);
+        emit TournamentCreated(id, tier, roundCount, arenasPerRound);
     }
 
-    /// @notice Advance tournament to next round
-    function advanceTournamentRound(uint256 tournamentId) external onlyOwner {
-        Tournament storage t = tournaments[tournamentId];
+    function addArenaToTournament(uint256 tid, uint256 arenaId, uint8 round) external onlyOwner {
+        if (tournaments[tid].roundCount == 0) revert TournamentNotFound();
+        if (round >= tournaments[tid].roundCount) revert InvalidRound();
+        arenas[arenaId].tournamentId = tid + 1;
+        tournamentRoundArenas[tid][round].push(arenaId);
+        emit TournamentArenaAdded(tid, round, arenaId);
+    }
+
+    function advanceTournamentRound(uint256 tid) external onlyOwner {
+        Tournament storage t = tournaments[tid];
         if (t.roundCount == 0) revert TournamentNotFound();
         if (t.finalized) revert TournamentAlreadyFinalized();
         t.currentRound++;
     }
 
-    /// @notice Finalize tournament — award pot to winner (must be last round, single qualified player)
-    function finalizeTournament(uint256 tournamentId) external onlyOwner {
-        Tournament storage t = tournaments[tournamentId];
+    function finalizeTournament(uint256 tid, address[] calldata winners) external onlyOwner nonReentrant {
+        Tournament storage t = tournaments[tid];
         if (t.roundCount == 0) revert TournamentNotFound();
         if (t.finalized) revert TournamentAlreadyFinalized();
-
-        uint8 lastRound = t.roundCount - 1;
-        address[] storage qualifiedPlayers = _tournamentQualifiedList[tournamentId][lastRound];
-        uint256 len = qualifiedPlayers.length;
-
+        uint256 len = winners.length;
         if (len > 0) {
             uint256 prize = t.pot / len;
-            for (uint256 i = 0; i < len; i++) {
-                (bool ok,) = qualifiedPlayers[i].call{value: prize}("");
-                if (ok) emit TournamentFinalized(tournamentId, qualifiedPlayers[i], prize);
+            for (uint256 i; i < len; ++i) {
+                (bool ok,) = winners[i].call{value: prize}("");
+                if (ok) {}
             }
         }
-
         t.finalized = true;
+        emit TournamentFinalized(tid);
     }
 
-    /// @notice Deposit into tournament pot
-    function depositTournamentPot(uint256 tournamentId) external payable onlyOwner {
-        if (tournaments[tournamentId].roundCount == 0) revert TournamentNotFound();
-        tournaments[tournamentId].pot += uint128(msg.value);
+    function depositTournamentPot(uint256 tid) external payable onlyOwner {
+        if (tournaments[tid].roundCount == 0) revert TournamentNotFound();
+        tournaments[tid].pot += uint128(msg.value);
     }
 
-    // ─── View Helpers ─────────────────────────────────────────────────
+    // ─── Views ────────────────────────────────────────────────────────
 
-    function getPlayers(uint256 arenaId) external view returns (address[] memory) {
-        return _players[arenaId];
-    }
+    function getArena(uint256 id) external view returns (Arena memory) { return arenas[id]; }
+    function getPlayerState(uint256 id, address p) external view returns (PlayerState memory) { return _playerState[id][arenaEpoch[id]][p]; }
+    function getTournament(uint256 id) external view returns (Tournament memory) { return tournaments[id]; }
+    function getPriceTape(uint256 id) external view returns (uint256[] memory) { return _priceTape[id]; }
+    function getOracleState(uint256 id) external view returns (OracleState memory) { return oracleState[id]; }
 
-    function getArena(uint256 arenaId) external view returns (Arena memory) {
-        return arenas[arenaId];
-    }
-
-    function getTournament(uint256 tournamentId) external view returns (Tournament memory) {
-        return tournaments[tournamentId];
-    }
-
-    function getTournamentRoundArenas(uint256 tournamentId, uint8 round) external view returns (uint256[] memory) {
-        return tournamentRoundArenas[tournamentId][round];
-    }
-
-    function getTournamentQualifiedPlayers(uint256 tournamentId, uint8 round) external view returns (address[] memory) {
-        return _tournamentQualifiedList[tournamentId][round];
-    }
-
-    function getStreakMultiplier(uint16 streak) external pure returns (uint16) {
-        return _getStreakMultiplier(streak);
-    }
-
-    /// @notice Compute commit hash off-chain helper
     function computeCommitHash(
-        uint256 arenaId, address player, bytes32 salt, uint256 bitPackedPredictions
+        uint256 arenaId, address player, bytes32 salt, uint256[] calldata predWords
     ) external pure returns (bytes32) {
-        return keccak256(abi.encodePacked(arenaId, player, salt, bitPackedPredictions));
+        return keccak256(abi.encodePacked(arenaId, player, salt, keccak256(abi.encode(predWords))));
     }
 
     // ─── Internal ─────────────────────────────────────────────────────
 
-    /// @dev Distribute rake: 80% treasury, 20% to referrers of participating players
-    function _distributeRake(uint256 rake, address[] storage players, uint256 len) internal {
-        uint256 referrerTotal = 0;
-
-        for (uint256 i = 0; i < len; i++) {
+    function _distributeRake(uint256 rake, address[] calldata players, uint256 len) internal {
+        uint256 refTotal;
+        for (uint256 i; i < len; ++i) {
             address ref = referrer[players[i]];
             if (ref != address(0)) {
-                // Each player's share of referrer portion: (rake * 20%) / playerCount
-                uint256 playerReferrerShare = (rake * REFERRER_SHARE_BPS) / (10000 * len);
-                referrerBalance[ref] += playerReferrerShare;
-                referrerTotal += playerReferrerShare;
-                emit ReferralPaid(ref, players[i], playerReferrerShare);
+                uint256 share = (rake * REFERRER_SHARE_BPS) / (10000 * len);
+                referrerBalance[ref] += share;
+                refTotal += share;
+                emit ReferralPaid(ref, players[i], share);
             }
         }
-
-        treasuryBalance += (rake - referrerTotal);
+        treasuryBalance += (rake - refTotal);
     }
 
-    /// @dev Apply god streak multiplier to pot share
-    function _applyStreakMultiplier(uint256 baseShare, uint16 streak) internal pure returns (uint256) {
-        uint16 mult = _getStreakMultiplier(streak);
-        return (baseShare * mult) / 10000;
-    }
-
-    /// @dev Get streak multiplier in basis points (10000 = 1x)
-    function _getStreakMultiplier(uint16 streak) internal pure returns (uint16) {
-        if (streak >= 5) return STREAK_5_MULT;
-        if (streak >= 3) return STREAK_3_MULT;
-        if (streak >= 2) return STREAK_2_MULT;
-        return 10000; // 1x
-    }
-
-    /// @dev Find first winner index (for NFT minting)
-    function _firstWinnerIndex(
-        address[] storage players, uint256 len, uint256 bestScore, uint256 arenaId
-    ) internal view returns (uint256) {
-        for (uint256 i = 0; i < len; i++) {
-            if (scores[arenaId][players[i]] == bestScore) return i;
-        }
-        return 0;
-    }
-
-    /// @dev Qualify player for current tournament round
-    function _qualifyForTournament(uint256 tournamentId, address player) internal {
-        Tournament storage t = tournaments[tournamentId];
-        uint8 round = t.currentRound;
-        if (!tournamentQualified[tournamentId][round][player]) {
-            tournamentQualified[tournamentId][round][player] = true;
-            _tournamentQualifiedList[tournamentId][round].push(player);
-            emit TournamentPlayerQualified(tournamentId, round, player);
-        }
-    }
-
-    /// @dev Popcount (Hamming weight) of a uint256.
-    function _popcount(uint256 x) internal pure returns (uint256 count) {
-        while (x != 0) {
-            x &= x - 1;
-            count++;
+    function _qualifyForTournament(uint256 tid, address player) internal {
+        uint8 round = tournaments[tid].currentRound;
+        if (!tournamentQualified[tid][round][player]) {
+            tournamentQualified[tid][round][player] = true;
+            emit TournamentPlayerQualified(tid, round, player);
         }
     }
 

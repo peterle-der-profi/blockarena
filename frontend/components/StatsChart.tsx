@@ -2,10 +2,6 @@
 
 import type { ArenaHistoryEntry } from '@/types';
 
-/**
- * Lightweight SVG-based chart — no external dependency.
- * Shows cumulative P&L over arena history.
- */
 export function PnLChart({ history }: { history: ArenaHistoryEntry[] }) {
   if (history.length < 2) return null;
 
@@ -31,40 +27,44 @@ export function PnLChart({ history }: { history: ArenaHistoryEntry[] }) {
   });
 
   const lastVal = cumulative[cumulative.length - 1];
-  const color = lastVal >= 0 ? '#4ade80' : '#f87171';
+  const isUp = lastVal >= 0;
+  const color = isUp ? '#39ff14' : '#ff1744';
 
   return (
     <div className="w-full">
-      <div className="text-sm font-bold text-gray-400 mb-2">Cumulative P&L</div>
+      <div className="text-[10px] text-gray-600 uppercase tracking-widest font-display mb-2">CUMULATIVE P&L</div>
       <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-auto">
-        {/* Zero line */}
+        <defs>
+          <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.2" />
+            <stop offset="100%" stopColor={color} stopOpacity="0" />
+          </linearGradient>
+        </defs>
         {min < 0 && max > 0 && (
           <line
-            x1={pad}
-            x2={w - pad}
+            x1={pad} x2={w - pad}
             y1={pad + (1 - (0 - min) / range) * (h - 2 * pad)}
             y2={pad + (1 - (0 - min) / range) * (h - 2 * pad)}
-            stroke="#6b7280"
-            strokeDasharray="4"
-            strokeWidth="1"
+            stroke="rgba(255,255,255,0.05)" strokeDasharray="4" strokeWidth="1"
           />
         )}
+        <polygon
+          fill="url(#pnlGrad)"
+          points={`${pad},${h - pad} ${points.join(' ')} ${w - pad},${h - pad}`}
+        />
         <polyline fill="none" stroke={color} strokeWidth="2" points={points.join(' ')} />
-        {/* End dot */}
         {points.length > 0 && (
           <circle
             cx={parseFloat(points[points.length - 1].split(',')[0])}
             cy={parseFloat(points[points.length - 1].split(',')[1])}
-            r="4"
-            fill={color}
+            r="4" fill={color}
           />
         )}
       </svg>
-      <div className="flex justify-between text-xs text-gray-500">
+      <div className="flex justify-between text-[10px] text-gray-600 font-display">
         <span>Oldest</span>
-        <span className={lastVal >= 0 ? 'text-green-400' : 'text-red-400'}>
-          {lastVal >= 0 ? '+' : ''}
-          {lastVal.toFixed(4)} ETH
+        <span className={isUp ? 'neon-text-green' : 'neon-text-red'}>
+          {isUp ? '+' : ''}{lastVal.toFixed(4)} ETH
         </span>
         <span>Latest</span>
       </div>
@@ -83,26 +83,32 @@ export function WinRateChart({ wins, losses }: { wins: number; losses: number })
   return (
     <div className="flex items-center gap-4">
       <svg width="100" height="100" viewBox="0 0 100 100">
-        <circle cx="50" cy="50" r={r} fill="none" stroke="#374151" strokeWidth="8" />
+        <circle cx="50" cy="50" r={r} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="8" />
         <circle
-          cx="50"
-          cy="50"
-          r={r}
-          fill="none"
-          stroke="#4ade80"
-          strokeWidth="8"
-          strokeDasharray={circ}
-          strokeDashoffset={offset}
-          strokeLinecap="round"
-          transform="rotate(-90 50 50)"
-        />
-        <text x="50" y="50" textAnchor="middle" dominantBaseline="central" fill="white" fontSize="16" fontWeight="bold">
+          cx="50" cy="50" r={r}
+          fill="none" stroke="#39ff14" strokeWidth="8"
+          strokeDasharray={circ} strokeDashoffset={offset}
+          strokeLinecap="round" transform="rotate(-90 50 50)"
+          style={{ filter: 'drop-shadow(0 0 6px rgba(57,255,20,0.4))' }}
+        >
+          <animate attributeName="stroke-dashoffset" from={circ} to={offset} dur="1s" fill="freeze" />
+        </circle>
+        <text x="50" y="46" textAnchor="middle" dominantBaseline="central" fill="white" fontSize="18" fontWeight="bold" fontFamily="Orbitron, monospace">
           {pct.toFixed(0)}%
         </text>
+        <text x="50" y="62" textAnchor="middle" fill="#666" fontSize="8" fontFamily="Inter, sans-serif">
+          WIN RATE
+        </text>
       </svg>
-      <div className="text-sm">
-        <div className="text-green-400">{wins} wins</div>
-        <div className="text-red-400">{losses} losses</div>
+      <div className="text-sm space-y-1">
+        <div className="flex items-center gap-2">
+          <div className="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_4px_rgba(57,255,20,0.5)]" />
+          <span className="text-green-400 font-display">{wins} wins</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_4px_rgba(255,23,68,0.5)]" />
+          <span className="text-red-400 font-display">{losses} losses</span>
+        </div>
       </div>
     </div>
   );

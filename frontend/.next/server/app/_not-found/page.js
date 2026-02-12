@@ -5,7 +5,7 @@ R.c("server/chunks/ssr/884b2_next_dist_esm_build_templates_app-page_5be4534e.js"
 R.c("server/chunks/ssr/[root-of-the-server]__878f7470._.js")
 R.c("server/chunks/ssr/[root-of-the-server]__cebdee5e._.js")
 R.c("server/chunks/ssr/[root-of-the-server]__b532b610._.js")
-R.c("server/chunks/ssr/_openclaw_workspace_blockarena_frontend_2d167932._.js")
+R.c("server/chunks/ssr/_openclaw_workspace_blockarena_frontend_5865f356._.js")
 R.c("server/chunks/ssr/884b2_next_dist_client_components_95154a3b._.js")
 R.c("server/chunks/ssr/884b2_next_dist_client_components_builtin_forbidden_4980064e.js")
 R.c("server/chunks/ssr/c111f_blockarena_frontend__next-internal_server_app__not-found_page_actions_6320e3f4.js")

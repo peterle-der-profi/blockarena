@@ -12,20 +12,22 @@ export function CountdownTimer({ blocksRemaining, totalBlocks, label }: Countdow
 
   return (
     <div className="w-full">
-      {label && <div className="text-xs text-gray-400 mb-1">{label}</div>}
-      <div className="relative h-3 bg-gray-800 rounded-full overflow-hidden">
+      {label && <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">{label}</div>}
+      <div className="relative h-2 bg-gray-800/50 rounded-full overflow-hidden">
         <div
           className={`h-full rounded-full transition-all duration-300 ${
-            isUrgent ? 'bg-red-500 animate-pulse' : 'bg-gradient-to-r from-green-500 to-blue-500'
+            isUrgent
+              ? 'bg-gradient-to-r from-red-600 to-red-400 shadow-[0_0_10px_rgba(255,23,68,0.5)] animate-pulse'
+              : 'bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 shadow-[0_0_8px_rgba(139,92,246,0.3)]'
           }`}
           style={{ width: `${Math.min(progress, 100)}%` }}
         />
       </div>
-      <div className="flex justify-between text-xs mt-1">
-        <span className={isUrgent ? 'text-red-400 font-bold animate-pulse' : 'text-gray-400'}>
-          {blocksRemaining} blocks left
+      <div className="flex justify-between text-[10px] mt-1">
+        <span className={isUrgent ? 'neon-text-red font-bold' : 'text-gray-500'}>
+          {blocksRemaining} blocks
         </span>
-        <span className="text-gray-500">{progress.toFixed(0)}%</span>
+        <span className="text-gray-600 font-display">{progress.toFixed(0)}%</span>
       </div>
     </div>
   );

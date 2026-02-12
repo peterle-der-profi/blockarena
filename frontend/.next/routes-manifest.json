@@ -53,6 +53,12 @@
       "namedRegex": "^/history(?:/)?$"
     },
     {
+      "page": "/leaderboard",
+      "regex": "^/leaderboard(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/leaderboard(?:/)?$"
+    },
+    {
       "page": "/overlay",
       "regex": "^/overlay(?:/)?$",
       "routeKeys": {},
