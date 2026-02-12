@@ -1,0 +1,9 @@
+{
+  "/_global-error/page": "/_global-error",
+  "/_not-found/page": "/_not-found",
+  "/gallery/page": "/gallery",
+  "/history/page": "/history",
+  "/overlay/page": "/overlay",
+  "/page": "/",
+  "/tournament/page": "/tournament"
+}

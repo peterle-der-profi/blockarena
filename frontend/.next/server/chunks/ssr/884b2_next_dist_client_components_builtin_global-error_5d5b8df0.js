@@ -1,0 +1,3 @@
+module.exports=[69585,(a,b,c)=>{let{createClientModuleProxy:d}=a.r(33812);a.n(d("[project]/.openclaw/workspace/blockarena/frontend/node_modules/next/dist/client/components/builtin/global-error.js <module evaluation>"))},36542,(a,b,c)=>{let{createClientModuleProxy:d}=a.r(33812);a.n(d("[project]/.openclaw/workspace/blockarena/frontend/node_modules/next/dist/client/components/builtin/global-error.js"))},42212,a=>{"use strict";a.i(69585);var b=a.i(36542);a.n(b)}];
+
+//# sourceMappingURL=884b2_next_dist_client_components_builtin_global-error_5d5b8df0.js.map
