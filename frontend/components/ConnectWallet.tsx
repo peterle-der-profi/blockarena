@@ -31,7 +31,7 @@ export function ConnectWallet() {
         onClick={login}
         className="px-4 py-1.5 rounded text-xs font-bold bg-white text-black hover:bg-neutral-200 transition-colors"
       >
-        {isPrivy ? 'PLAY' : 'CONNECT'}
+        CONNECT
       </button>
       {!isPrivy && (
         <button

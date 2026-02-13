@@ -23,7 +23,7 @@ function PrivyWrapper({ children }: { children: ReactNode }) {
         },
         defaultChain: activeChain,
         supportedChains: [activeChain],
-        loginMethods: ['email', 'google', 'twitter', 'wallet'],
+        loginMethods: ['email', 'google', 'twitter'],
         appearance: {
           theme: 'dark',
           accentColor: '#ffffff',
