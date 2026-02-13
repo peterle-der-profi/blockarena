@@ -18,7 +18,7 @@ function PrivyWrapper({ children }: { children: ReactNode }) {
       config={{
         embeddedWallets: {
           ethereum: {
-            createOnLogin: 'users-without-wallets',
+            createOnLogin: 'all-users',
           },
         },
         defaultChain: activeChain,
