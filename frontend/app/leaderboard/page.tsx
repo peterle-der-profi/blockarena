@@ -1,21 +1,25 @@
 'use client';
 
-import { useApiLeaderboard } from '@/hooks/useApi';
+import { useState, useEffect } from 'react';
 import { useWallet } from '@/hooks/useWallet';
 import { ConnectWallet } from '@/components/ConnectWallet';
+import { fetchLeaderboard, fetchProtocolStats, type GqlPlayer, type GqlProtocolStats } from '@/lib/graphql';
+import { formatEther } from 'viem';
 import Link from 'next/link';
 
-const MOCK_LEADERBOARD = Array.from({ length: 20 }, (_, i) => ({
-  address: `0x${(i + 1).toString(16).padStart(40, 'a')}`,
-  wins: 50 - i * 2,
-  streak: Math.max(0, 15 - i),
-  totalPnL: `${(5 - i * 0.3).toFixed(2)}`,
-}));
-
 export default function LeaderboardPage() {
-  const entries = useApiLeaderboard();
+  const [players, setPlayers] = useState<GqlPlayer[]>([]);
+  const [stats, setStats] = useState<GqlProtocolStats | null>(null);
+  const [loading, setLoading] = useState(true);
   const { address } = useWallet();
-  const data = entries.length > 0 ? entries : MOCK_LEADERBOARD;
+
+  useEffect(() => {
+    Promise.all([fetchLeaderboard(), fetchProtocolStats()]).then(([p, s]) => {
+      setPlayers(p);
+      setStats(s);
+      setLoading(false);
+    });
+  }, []);
 
   return (
     <div className="min-h-screen">
@@ -30,6 +34,22 @@ export default function LeaderboardPage() {
       </header>
 
       <main className="max-w-4xl mx-auto px-4 py-6">
+        {/* Protocol Stats */}
+        {stats && (
+          <div className="grid grid-cols-3 gap-3 mb-6">
+            {[
+              { label: 'TOTAL ARENAS', value: stats.totalArenas.toString() },
+              { label: 'PLAYERS', value: stats.totalPlayers.toString() },
+              { label: 'VOLUME', value: `${formatEther(BigInt(stats.totalVolume))} ETH` },
+            ].map((s) => (
+              <div key={s.label} className="border border-[#222] rounded-lg p-3 bg-[#111] text-center">
+                <div className="text-[10px] text-neutral-600 uppercase tracking-wider mb-1">{s.label}</div>
+                <div className="text-sm font-bold text-white">{s.value}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Table header */}
         <div className="flex items-center justify-between px-3 py-2 text-[10px] text-neutral-600 uppercase tracking-wider border-b border-[#222]">
           <div className="flex items-center gap-3">
@@ -39,16 +59,26 @@ export default function LeaderboardPage() {
           <div className="flex items-center gap-6">
             <span className="w-12 text-right">STREAK</span>
             <span className="w-12 text-right">WINS</span>
-            <span className="w-20 text-right">P&L</span>
+            <span className="w-16 text-right">ARENAS</span>
+            <span className="w-24 text-right">EARNINGS</span>
           </div>
         </div>
 
+        {loading && (
+          <div className="text-center py-16 text-neutral-600 text-sm">Loading...</div>
+        )}
+
+        {!loading && players.length === 0 && (
+          <div className="text-center py-16 text-neutral-600 text-sm">No players yet. Be the first!</div>
+        )}
+
         {/* Rows */}
-        {data.map((entry, i) => {
-          const isYou = address?.toLowerCase() === entry.address.toLowerCase();
+        {players.map((player, i) => {
+          const isYou = address?.toLowerCase() === player.id.toLowerCase();
+          const earnings = BigInt(player.totalEarnings);
           return (
             <div
-              key={i}
+              key={player.id}
               className={`flex items-center justify-between px-3 py-2.5 text-xs border-b border-[#161616] ${
                 isYou ? 'bg-[#161616]' : 'hover:bg-[#111]'
               } transition-colors`}
@@ -58,19 +88,19 @@ export default function LeaderboardPage() {
                   {i + 1}
                 </span>
                 <span className="text-neutral-400">
-                  {entry.address.slice(0, 6)}...{entry.address.slice(-4)}
+                  {player.id.slice(0, 6)}...{player.id.slice(-4)}
                   {isYou && <span className="ml-2 text-white text-[10px]">(YOU)</span>}
+                  {player.isFlagged && <span className="ml-2 text-red-500 text-[10px]">⚠</span>}
                 </span>
               </div>
               <div className="flex items-center gap-6">
                 <span className="w-12 text-right text-neutral-500">
-                  {entry.streak > 0 ? `${entry.streak}x` : '-'}
+                  {player.godStreak > 0 ? `${player.godStreak}x` : '-'}
                 </span>
-                <span className="w-12 text-right text-white font-bold">{entry.wins}</span>
-                <span className={`w-20 text-right font-bold ${
-                  parseFloat(entry.totalPnL) >= 0 ? 'text-green-500' : 'text-red-500'
-                }`}>
-                  {parseFloat(entry.totalPnL) >= 0 ? '+' : ''}{entry.totalPnL}
+                <span className="w-12 text-right text-white font-bold">{player.totalWins}</span>
+                <span className="w-16 text-right text-neutral-500">{player.totalArenas}</span>
+                <span className={`w-24 text-right font-bold ${earnings > 0n ? 'text-green-500' : 'text-neutral-500'}`}>
+                  {earnings > 0n ? `+${formatEther(earnings)}` : '0'} ETH
                 </span>
               </div>
             </div>
