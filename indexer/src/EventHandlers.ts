@@ -1,20 +1,22 @@
 import {
   BlockArena,
-  Arena,
-  Player,
-  ArenaEntry,
-  ReferralPayment,
-  Tournament,
-  TournamentArena,
-  TournamentQualification,
-  EmergencyEvent,
-  TreasuryWithdrawal,
-  ProtocolStats,
 } from "generated";
+import type {
+  Arena_t,
+  Player_t,
+  ArenaEntry_t,
+  ReferralPayment_t,
+  Tournament_t,
+  TournamentArena_t,
+  TournamentQualification_t,
+  EmergencyEvent_t,
+  TreasuryWithdrawal_t,
+  ProtocolStats_t,
+} from "generated/src/db/Entities.gen";
 
 // ─── Helpers ───
 
-function getOrDefaultPlayer(existing: Player | undefined, id: string): Player {
+function getOrDefaultPlayer(existing: Player_t | undefined, id: string): Player_t {
   return existing ?? {
     id,
     totalArenas: 0,
@@ -27,7 +29,7 @@ function getOrDefaultPlayer(existing: Player | undefined, id: string): Player {
   };
 }
 
-function getOrDefaultStats(existing: ProtocolStats | undefined): ProtocolStats {
+function getOrDefaultStats(existing: ProtocolStats_t | undefined): ProtocolStats_t {
   return existing ?? {
     id: "singleton",
     totalArenas: 0,
@@ -41,9 +43,9 @@ function getOrDefaultStats(existing: ProtocolStats | undefined): ProtocolStats {
 // ─── Arena Events ───
 
 BlockArena.ArenaCreated.handler(async ({ event, context }) => {
-  const arena: Arena = {
+  const arena: Arena_t = {
     id: event.params.arenaId.toString(),
-    tier: Number(event.params.tier),
+    tier: event.params.tier,
     entryFee: event.params.entryFee,
     startBlock: Number(event.params.startBlock),
     endBlock: Number(event.params.endBlock),
@@ -71,7 +73,7 @@ BlockArena.ArenaFinalized.handler(async ({ event, context }) => {
       ...arena,
       isFinalized: true,
       winnerCount: Number(event.params.winnerCount),
-      bestScore: Number(event.params.bestScore),
+      bestScore: event.params.bestScore,
       finalizedAt: event.block.number,
     });
   }
@@ -83,7 +85,7 @@ BlockArena.ArenaReset.handler(async ({ event, context }) => {
   if (arena) {
     context.Arena.set({
       ...arena,
-      epoch: Number(event.params.newEpoch),
+      epoch: event.params.newEpoch,
       isFinalized: false,
       playerCount: 0,
       winnerCount: 0,
@@ -103,25 +105,28 @@ BlockArena.PlayerJoined.handler(async ({ event, context }) => {
   // Update player
   const player = getOrDefaultPlayer(await context.Player.get(playerAddr), playerAddr);
   const isNew = player.totalArenas === 0;
-  context.Player.set({ ...player, totalArenas: player.totalArenas + 1 });
+  const updatedPlayer = { ...player, totalArenas: player.totalArenas + 1 };
 
   // Set referrer if non-zero
   if (refAddr !== "0x0000000000000000000000000000000000000000" && !player.referrer_id) {
     const ref = getOrDefaultPlayer(await context.Player.get(refAddr), refAddr);
     context.Player.set({ ...ref }); // ensure referrer exists
-    context.Player.set({ ...player, totalArenas: player.totalArenas + 1, referrer_id: refAddr });
+    context.Player.set({ ...updatedPlayer, referrer_id: refAddr });
+  } else {
+    context.Player.set(updatedPlayer);
   }
 
   // Create arena entry
   const entryId = `${arenaId}-${playerAddr}`;
-  context.ArenaEntry.set({
+  const entry: ArenaEntry_t = {
     id: entryId,
     arena_id: arenaId,
     player_id: playerAddr,
     committed: false,
     revealed: false,
     wonAmount: 0n,
-  });
+  };
+  context.ArenaEntry.set(entry);
 
   // Update arena player count
   const arena = await context.Arena.get(arenaId);
@@ -187,14 +192,15 @@ BlockArena.ReferralPaid.handler(async ({ event, context }) => {
   const refAddr = event.params.ref.toLowerCase();
   const playerAddr = event.params.player.toLowerCase();
 
-  context.ReferralPayment.set({
-    id: `${event.block.hash}-${event.logIndex}`,
+  const payment: ReferralPayment_t = {
+    id: `${event.block.number}-${event.logIndex}`,
     referrer_id: refAddr,
     player_id: playerAddr,
     amount: event.params.amount,
     blockNumber: event.block.number,
     timestamp: event.block.timestamp,
-  });
+  };
+  context.ReferralPayment.set(payment);
 
   // Update referrer earnings
   const ref = getOrDefaultPlayer(await context.Player.get(refAddr), refAddr);
@@ -216,7 +222,7 @@ BlockArena.ReferrerSet.handler(async ({ event, context }) => {
 BlockArena.GodStreakUpdate.handler(async ({ event, context }) => {
   const playerAddr = event.params.player.toLowerCase();
   const player = getOrDefaultPlayer(await context.Player.get(playerAddr), playerAddr);
-  context.Player.set({ ...player, godStreak: Number(event.params.streak) });
+  context.Player.set({ ...player, godStreak: event.params.streak });
 });
 
 BlockArena.BotDetected.handler(async ({ event, context }) => {
@@ -229,13 +235,14 @@ BlockArena.BotDetected.handler(async ({ event, context }) => {
 
 BlockArena.TournamentCreated.handler(async ({ event, context }) => {
   const id = event.params.tournamentId.toString();
-  context.Tournament.set({
+  const tournament: Tournament_t = {
     id,
-    tier: Number(event.params.tier),
-    roundCount: Number(event.params.roundCount),
-    arenasPerRound: Number(event.params.arenasPerRound),
+    tier: event.params.tier,
+    roundCount: event.params.roundCount,
+    arenasPerRound: event.params.arenasPerRound,
     isFinalized: false,
-  });
+  };
+  context.Tournament.set(tournament);
 
   const stats = getOrDefaultStats(await context.ProtocolStats.get("singleton"));
   context.ProtocolStats.set({ ...stats, totalTournaments: stats.totalTournaments + 1 });
@@ -252,14 +259,15 @@ BlockArena.TournamentFinalized.handler(async ({ event, context }) => {
 BlockArena.TournamentArenaAdded.handler(async ({ event, context }) => {
   const tournamentId = event.params.tournamentId.toString();
   const arenaId = event.params.arenaId.toString();
-  const round = Number(event.params.round);
+  const round = event.params.round;
 
-  context.TournamentArena.set({
+  const ta: TournamentArena_t = {
     id: `${tournamentId}-${round}-${arenaId}`,
     tournament_id: tournamentId,
     round,
     arena_id: arenaId,
-  });
+  };
+  context.TournamentArena.set(ta);
 
   // Link arena to tournament
   const arena = await context.Arena.get(arenaId);
@@ -271,66 +279,71 @@ BlockArena.TournamentArenaAdded.handler(async ({ event, context }) => {
 BlockArena.TournamentPlayerQualified.handler(async ({ event, context }) => {
   const tournamentId = event.params.tournamentId.toString();
   const playerAddr = event.params.player.toLowerCase();
-  const round = Number(event.params.round);
+  const round = event.params.round;
 
-  context.TournamentQualification.set({
+  const tq: TournamentQualification_t = {
     id: `${tournamentId}-${round}-${playerAddr}`,
     tournament_id: tournamentId,
     round,
     player_id: playerAddr,
-  });
+  };
+  context.TournamentQualification.set(tq);
 });
 
 // ─── Emergency & Admin Events ───
 
 BlockArena.EmergencyWithdraw.handler(async ({ event, context }) => {
-  context.EmergencyEvent.set({
-    id: `${event.block.hash}-${event.logIndex}`,
+  const ee: EmergencyEvent_t = {
+    id: `${event.block.number}-${event.logIndex}`,
     arenaId: event.params.arenaId,
     player_id: event.params.player.toLowerCase(),
     amount: event.params.amount,
     eventType: "withdraw",
     blockNumber: event.block.number,
     timestamp: event.block.timestamp,
-  });
+  };
+  context.EmergencyEvent.set(ee);
 });
 
 BlockArena.Paused.handler(async ({ event, context }) => {
-  context.EmergencyEvent.set({
-    id: `${event.block.hash}-${event.logIndex}`,
+  const ee: EmergencyEvent_t = {
+    id: `${event.block.number}-${event.logIndex}`,
     arenaId: undefined,
     player_id: undefined,
     amount: undefined,
     eventType: "paused",
     blockNumber: event.block.number,
     timestamp: event.block.timestamp,
-  });
+  };
+  context.EmergencyEvent.set(ee);
 
   const stats = getOrDefaultStats(await context.ProtocolStats.get("singleton"));
   context.ProtocolStats.set({ ...stats, isPaused: true });
 });
 
 BlockArena.Unpaused.handler(async ({ event, context }) => {
-  context.EmergencyEvent.set({
-    id: `${event.block.hash}-${event.logIndex}`,
+  const ee: EmergencyEvent_t = {
+    id: `${event.block.number}-${event.logIndex}`,
     arenaId: undefined,
     player_id: undefined,
     amount: undefined,
     eventType: "unpaused",
     blockNumber: event.block.number,
     timestamp: event.block.timestamp,
-  });
+  };
+  context.EmergencyEvent.set(ee);
 
   const stats = getOrDefaultStats(await context.ProtocolStats.get("singleton"));
   context.ProtocolStats.set({ ...stats, isPaused: false });
 });
 
 BlockArena.TreasuryWithdrawn.handler(async ({ event, context }) => {
-  context.TreasuryWithdrawal.set({
-    id: `${event.block.hash}-${event.logIndex}`,
+  const tw: TreasuryWithdrawal_t = {
+    id: `${event.block.number}-${event.logIndex}`,
     to: event.params.to.toLowerCase(),
     amount: event.params.amount,
     blockNumber: event.block.number,
     timestamp: event.block.timestamp,
-  });
+  };
+  context.TreasuryWithdrawal.set(tw);
 });
