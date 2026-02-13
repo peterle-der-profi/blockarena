@@ -6,6 +6,9 @@ export const config = createConfig({
   transports: {
     [megaethTestnet.id]: http(),
   },
+  // Disable auto-reconnect to prevent Rabby/MetaMask from hijacking Privy
+  syncConnectedChain: false,
+  multiInjectedProviderDiscovery: false,
 });
 
 declare module 'wagmi' {
