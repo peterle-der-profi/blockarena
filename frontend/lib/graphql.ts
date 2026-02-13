@@ -2,7 +2,8 @@
  * GraphQL client for Envio HyperIndex.
  */
 
-const GRAPHQL_URL = process.env.NEXT_PUBLIC_GRAPHQL_URL || '';
+// Hardcoded fallback since NEXT_PUBLIC_ vars are baked at build time
+const GRAPHQL_URL = process.env.NEXT_PUBLIC_GRAPHQL_URL || 'https://indexer.dev.hyperindex.xyz/3bdfc65/v1/graphql';
 
 export interface GqlPlayer {
   id: string;
