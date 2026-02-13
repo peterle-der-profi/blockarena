@@ -29,8 +29,8 @@ contracts:
 
 networks:
   - id: 6343  # MegaETH testnet
-    rpc_config:
-      url: https://carrot.megaeth.com/rpc
+    hypersync_config:
+      url: https://megaeth-testnet2.hypersync.xyz
     start_block: 11250000
     contracts:
       - name: BlockArena
